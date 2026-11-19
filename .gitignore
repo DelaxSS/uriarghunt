@@ -1,0 +1,12 @@
+uriarghunt.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+report.json
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
