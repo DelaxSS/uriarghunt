@@ -5,11 +5,13 @@ package report
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"uriarghunt/internal/argv"
 	"uriarghunt/internal/browser"
 	"uriarghunt/internal/fingerprint"
+	"uriarghunt/internal/fuses"
 	"uriarghunt/internal/registry"
 )
 
@@ -52,7 +54,10 @@ func TestEvaluateFinding_Tiers(t *testing.T) {
 			Analysis: registry.AnalyzeTemplate(cmd),
 		}
 		p := argv.ProbeTemplate(scheme, cmd)
-		br := browser.Evaluate(p)
+		br := browser.Evaluate(p, browser.TargetContext{
+			IsCmdShell:                fp.IsCmdShell(),
+			PlaceholderDirectlyQuoted: h.Analysis.PlaceholderDirectlyQuoted,
+		})
 		return EvaluateFinding(h, p, fp, br)
 	}
 
@@ -78,38 +83,68 @@ func TestEvaluateFinding_Tiers(t *testing.T) {
 		t.Errorf("native split: got %v, want Tier1", f.Tier)
 	}
 
-	if f := eval("spotify", `"C:\Spotify\Spotify.exe" --uri="%1"`, fingerprint.Info{
-		Exists:          true,
-		Runtime:         fingerprint.RuntimeCEF,
-		HighRiskRuntime: true,
-	}); f.Tier != Tier2 {
-		t.Errorf("CEF local-only: got %v, want Tier2", f.Tier)
-	}
-
-	if f := eval("openvpn-connect", `"C:\OVPN\OpenVPNConnect.exe" "%1"`, fingerprint.Info{
+	// Plain "%1" Electron/CEF without "--" is blocked by Chromium %22/%20/%5C encoding,
+	// so it must land in Tier 2 (with missing-- noted), not inflated to Tier 3.
+	fOVPN := eval("openvpn-connect", `"C:\OVPN\OpenVPNConnect.exe" "%1"`, fingerprint.Info{
 		Exists:          true,
 		Runtime:         fingerprint.RuntimeElectron,
 		HighRiskRuntime: true,
-	}); f.Tier != Tier3 {
-		t.Errorf("Electron missing '--': got %v, want Tier3", f.Tier)
+		Fuses: &fuses.Info{
+			Found:                true,
+			RunAsNode:            fuses.StateDisabled,
+			EnableNodeCliInspect: fuses.StateDisabled,
+			InspectHardened:      true,
+		},
+	})
+	if fOVPN.Tier != Tier2 {
+		t.Errorf("browser-blocked Electron missing '--': got %v, want Tier2", fOVPN.Tier)
+	}
+	joinedReasons := strings.Join(fOVPN.Reasons, "; ")
+	if !strings.Contains(joinedReasons, "missing--") || !strings.Contains(joinedReasons, "fuses:hardened") {
+		t.Errorf("expected missing-- and fuses:hardened in reasons: %q", joinedReasons)
 	}
 
+	// Local ShellExecute trailing backslash before '--' on Electron is Tier 2 (blocked in Chromium %5C).
 	if f := eval("trailapp", `"C:\Trail\app.exe" "%1" --extra`, fingerprint.Info{
 		Exists:          true,
 		Runtime:         fingerprint.RuntimeElectron,
 		HighRiskRuntime: true,
-	}); f.Tier != Tier3 || f.Browser.Reachability != browser.ReachabilityBrowserSplit {
-		t.Errorf("pre-'--' backslash break: got tier=%v reach=%v", f.Tier, f.Browser.Reachability)
+	}); f.Tier != Tier2 || f.Browser.Reachability != browser.ReachabilityLocalBackslash {
+		t.Errorf("pre-'--' local backslash break: got tier=%v reach=%v", f.Tier, f.Browser.Reachability)
 	}
 
+	// Local trailing backslash after '--' is positional corruption only -> Tier 1.
 	if f := eval("postdd", `"C:\Post\app.exe" -- "%1" "--foo"`, fingerprint.Info{
 		Exists:          true,
 		Runtime:         fingerprint.RuntimeElectron,
 		HighRiskRuntime: true,
-	}); f.Tier != Tier1 || f.Browser.Reachability != browser.ReachabilityBrowserPosSplit {
-		t.Errorf("post-'--' backslash break: got tier=%v reach=%v", f.Tier, f.Browser.Reachability)
+	}); f.Tier != Tier1 || f.Browser.Reachability != browser.ReachabilityLocalBackslashDD {
+		t.Errorf("post-'--' local backslash break: got tier=%v reach=%v", f.Tier, f.Browser.Reachability)
 	}
 
+	// Unquoted .bat / cmd.exe handler receives raw '&' through Chromium -> genuine Tier 3.
+	if f := eval("badbatch", `C:\Tools\handler.bat %1`, fingerprint.Info{
+		Exists:          true,
+		ResolvedPath:    `C:\Tools\handler.bat`,
+		Runtime:         fingerprint.RuntimeShell,
+		HighRiskRuntime: true,
+	}); f.Tier != Tier3 || f.Browser.Reachability != browser.ReachabilityBrowserCmdAmp {
+		t.Errorf("unquoted .bat handler: got tier=%v reach=%v, want Tier3 + browser-cmd-amp",
+			f.Tier, f.Browser.Reachability)
+	}
+
+	// Outer-quoted `cmd.exe /c "start x.exe %1"` leaves %1 unquoted after /c strips outer quotes -> Tier 3.
+	if f := eval("outercmd", `cmd.exe /c "start x.exe %1"`, fingerprint.Info{
+		Exists:          true,
+		ResolvedPath:    `C:\Windows\System32\cmd.exe`,
+		Runtime:         fingerprint.RuntimeShell,
+		HighRiskRuntime: true,
+	}); f.Tier != Tier3 || f.Browser.Reachability != browser.ReachabilityBrowserCmdAmp {
+		t.Errorf("outer-quoted cmd /c handler: got tier=%v reach=%v, want Tier3 + browser-cmd-amp",
+			f.Tier, f.Browser.Reachability)
+	}
+
+	// Existing binary with unquoted spaces in exe path must be at least Tier 1.
 	if f := eval("unqstatic", `C:\Program Files\My App\app.exe --launch`, fingerprint.Info{
 		Exists:  true,
 		Runtime: fingerprint.RuntimeNative,
@@ -128,9 +163,9 @@ func TestEvaluateFinding_Tiers(t *testing.T) {
 
 func TestBuildReport_FilterSortAndJSON(t *testing.T) {
 	findings := []Finding{
-		{Scheme: "http", Tier: Tier3, TierLabel: "TIER 3", Builtin: true, Handler: registry.Handler{Command: `"msedge.exe" "%1"`, Hive: registry.HiveHKLM}},
+		{Scheme: "http", Tier: Tier2, TierLabel: "TIER 2", Builtin: true, Handler: registry.Handler{Command: `"msedge.exe" "%1"`, Hive: registry.HiveHKLM}},
 		{Scheme: "z-native", Tier: Tier1, TierLabel: "TIER 1", Builtin: false, Handler: registry.Handler{Command: `"z.exe" "%1"`, Hive: registry.HiveHKCU}},
-		{Scheme: "a-electron", Tier: Tier3, TierLabel: "TIER 3", Builtin: false, Handler: registry.Handler{Command: `"a.exe" "%1"`, Hive: registry.HiveHKCU}},
+		{Scheme: "a-batch", Tier: Tier3, TierLabel: "TIER 3", Builtin: false, Handler: registry.Handler{Command: `C:\t\run.bat %1`, Hive: registry.HiveHKCU}},
 		{Scheme: "b-cef", Tier: Tier2, TierLabel: "TIER 2", Builtin: false, Handler: registry.Handler{Command: `"b.exe" --uri="%1"`, Hive: registry.HiveHKCU}},
 	}
 
@@ -138,8 +173,8 @@ func TestBuildReport_FilterSortAndJSON(t *testing.T) {
 	if len(rep.Findings) != 2 {
 		t.Fatalf("len(Findings) = %d, want 2", len(rep.Findings))
 	}
-	if rep.Findings[0].Scheme != "a-electron" || rep.Findings[1].Scheme != "b-cef" {
-		t.Errorf("order = [%s, %s], want [a-electron, b-cef]", rep.Findings[0].Scheme, rep.Findings[1].Scheme)
+	if rep.Findings[0].Scheme != "a-batch" || rep.Findings[1].Scheme != "b-cef" {
+		t.Errorf("order = [%s, %s], want [a-batch, b-cef]", rep.Findings[0].Scheme, rep.Findings[1].Scheme)
 	}
 	if rep.Summary.HiddenBuiltinCount != 1 {
 		t.Errorf("HiddenBuiltinCount = %d, want 1", rep.Summary.HiddenBuiltinCount)
@@ -166,13 +201,18 @@ func TestFormatFlagLabel(t *testing.T) {
 		want string
 	}{
 		{
-			name: "backslash break before --",
-			br:   browser.Assessment{BackslashBreak: true},
-			want: "BSLASH!",
+			name: "browser cmd ampersand",
+			br:   browser.Assessment{ShellAmpersandSurvive: true},
+			want: "CMD&!",
 		},
 		{
-			name: "backslash break after --",
-			br:   browser.Assessment{BackslashBreak: true, BackslashAfterDD: true},
+			name: "local backslash break before --",
+			br:   browser.Assessment{Local: browser.LocalResult{BackslashBreak: true}},
+			want: "BSLASH",
+		},
+		{
+			name: "local backslash break after --",
+			br:   browser.Assessment{Local: browser.LocalResult{BackslashBreak: true, BackslashAfterDD: true}},
 			want: "bslash--",
 		},
 		{
@@ -205,35 +245,46 @@ func TestFormatFlagLabel(t *testing.T) {
 	}
 }
 
-func TestWriteInspect_DynamicBackslashProfile(t *testing.T) {
+func TestWriteInspect_ShowsFusesAndLocalBackslash(t *testing.T) {
 	f := Finding{
-		Scheme:    "ffonly",
-		Tier:      Tier3,
-		TierLabel: "TIER 3",
-		Browser: browser.Assessment{
-			Reachability:   browser.ReachabilityBrowserSplit,
-			BackslashBreak: true,
-			ChromeEdge130: browser.ChannelResult{
-				Profile:        browser.ProfileChromeEdge130,
-				BackslashBreak: false,
+		Scheme:    "demo",
+		Tier:      Tier2,
+		TierLabel: "TIER 2",
+		Probe:     argv.ProbeReport{HasDoubleDash: false},
+		Fingerprint: fingerprint.Info{
+			Runtime: fingerprint.RuntimeElectron,
+			Fuses: &fuses.Info{
+				Found:                true,
+				RunAsNode:            fuses.StateDisabled,
+				EnableNodeCliInspect: fuses.StateDisabled,
+				EnableNodeOptionsEnv: fuses.StateEnabled,
+				OnlyLoadAppFromAsar:  fuses.StateDisabled,
+				InspectHardened:      true,
+				RawWire:              "00100001",
 			},
-			FirefoxCurrent: browser.ChannelResult{
-				Profile:        browser.ProfileFirefoxCurrent,
+		},
+		Browser: browser.Assessment{
+			Reachability: browser.ReachabilityLocalBackslash,
+			Local: browser.LocalResult{
 				BackslashBreak: true,
-				BackslashURI:   `ffonly://probe\`,
+				BackslashURI:   `demo://host/probe\`,
 				BackslashDelta: -1,
-				BackslashArgv:  []string{"app.exe", `ffonly://probe" --tail`},
+				BackslashArgv:  []string{"app.exe", `demo://host/probe" --tail`},
 			},
 		},
 	}
 
 	var buf bytes.Buffer
 	WriteInspect(&buf, f)
+	out := buf.String()
 
-	if !bytes.Contains(buf.Bytes(), []byte("[firefox-current | before --]")) {
-		t.Errorf("missing dynamic Firefox profile line:\n%s", buf.String())
-	}
-	if bytes.Contains(buf.Bytes(), []byte("[chrome-edge-130+")) {
-		t.Errorf("unexpected Chrome/Edge profile line:\n%s", buf.String())
+	for _, want := range []string{
+		"[Electron Fuses v1]",
+		`wire="00100001", hardened=true`,
+		"[local ShellExecute | before --]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("WriteInspect missing %q:\n%s", want, out)
+		}
 	}
 }

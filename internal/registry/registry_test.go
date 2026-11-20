@@ -9,29 +9,20 @@ import (
 
 func TestAnalyzeTemplate(t *testing.T) {
 	tests := []struct {
-		name               string
-		cmd                string
-		wantPlaceholder    string
-		wantQuoted         bool
-		wantDoubleDash     bool
-		wantExe            string
-		wantUnquotedSpaces bool
+		name                   string
+		cmd                    string
+		wantPlaceholder        string
+		wantQuoted             bool
+		wantDirectlyQuoted     bool
+		wantExe                string
+		wantUnquotedSpaces     bool
 	}{
 		{
-			name:               "quoted exe and quoted %1 without --",
+			name:               "quoted exe and quoted %1",
 			cmd:                `"C:\Program Files\VS Code\Code.exe" --open-url "%1"`,
 			wantPlaceholder:    "%1",
 			wantQuoted:         true,
-			wantDoubleDash:     false,
-			wantExe:            `C:\Program Files\VS Code\Code.exe`,
-			wantUnquotedSpaces: false,
-		},
-		{
-			name:               "quoted exe with -- before %1",
-			cmd:                `"C:\Program Files\VS Code\Code.exe" --open-url -- "%1"`,
-			wantPlaceholder:    "%1",
-			wantQuoted:         true,
-			wantDoubleDash:     true,
+			wantDirectlyQuoted: true,
 			wantExe:            `C:\Program Files\VS Code\Code.exe`,
 			wantUnquotedSpaces: false,
 		},
@@ -40,7 +31,7 @@ func TestAnalyzeTemplate(t *testing.T) {
 			cmd:                `C:\Program Files\My App\client.exe %1`,
 			wantPlaceholder:    "%1",
 			wantQuoted:         false,
-			wantDoubleDash:     false,
+			wantDirectlyQuoted: false,
 			wantExe:            `C:\Program Files\My App\client.exe`,
 			wantUnquotedSpaces: true,
 		},
@@ -49,7 +40,7 @@ func TestAnalyzeTemplate(t *testing.T) {
 			cmd:                `C:\Windows\System32\rundll32.exe url.dll,FileProtocolHandler %l`,
 			wantPlaceholder:    "%l",
 			wantQuoted:         false,
-			wantDoubleDash:     false,
+			wantDirectlyQuoted: false,
 			wantExe:            `C:\Windows\System32\rundll32.exe`,
 			wantUnquotedSpaces: false,
 		},
@@ -58,8 +49,44 @@ func TestAnalyzeTemplate(t *testing.T) {
 			cmd:                `"C:\App\app.exe" --url="%1"`,
 			wantPlaceholder:    "%1",
 			wantQuoted:         true,
-			wantDoubleDash:     false,
+			wantDirectlyQuoted: true,
 			wantExe:            `C:\App\app.exe`,
+			wantUnquotedSpaces: false,
+		},
+		{
+			name:               "bare cmd /c with script arg does not merge .bat into exe",
+			cmd:                `cmd /c C:\tools\run.bat %1`,
+			wantPlaceholder:    "%1",
+			wantQuoted:         false,
+			wantDirectlyQuoted: false,
+			wantExe:            `cmd`,
+			wantUnquotedSpaces: false,
+		},
+		{
+			name:               "bare powershell -File with .ps1 arg does not merge .ps1 into exe",
+			cmd:                `powershell -File C:\x.ps1 %1`,
+			wantPlaceholder:    "%1",
+			wantQuoted:         false,
+			wantDirectlyQuoted: false,
+			wantExe:            `powershell`,
+			wantUnquotedSpaces: false,
+		},
+		{
+			name:               "cmd /c outer-quoted command leaves %1 not directly quoted",
+			cmd:                `cmd.exe /c "start x.exe %1"`,
+			wantPlaceholder:    "%1",
+			wantQuoted:         true,
+			wantDirectlyQuoted: false,
+			wantExe:            `cmd.exe`,
+			wantUnquotedSpaces: false,
+		},
+		{
+			name:               "cmd /c outer-quoted batch command leaves %1 not directly quoted",
+			cmd:                `cmd /c "C:\a.bat %1"`,
+			wantPlaceholder:    "%1",
+			wantQuoted:         true,
+			wantDirectlyQuoted: false,
+			wantExe:            `cmd`,
 			wantUnquotedSpaces: false,
 		},
 		{
@@ -67,7 +94,7 @@ func TestAnalyzeTemplate(t *testing.T) {
 			cmd:                `"C:\App\launcher.exe" --start`,
 			wantPlaceholder:    "",
 			wantQuoted:         false,
-			wantDoubleDash:     false,
+			wantDirectlyQuoted: false,
 			wantExe:            `C:\App\launcher.exe`,
 			wantUnquotedSpaces: false,
 		},
@@ -82,8 +109,8 @@ func TestAnalyzeTemplate(t *testing.T) {
 			if got.PlaceholderQuoted != tc.wantQuoted {
 				t.Errorf("PlaceholderQuoted = %v, want %v", got.PlaceholderQuoted, tc.wantQuoted)
 			}
-			if got.HasDoubleDash != tc.wantDoubleDash {
-				t.Errorf("HasDoubleDash = %v, want %v", got.HasDoubleDash, tc.wantDoubleDash)
+			if got.PlaceholderDirectlyQuoted != tc.wantDirectlyQuoted {
+				t.Errorf("PlaceholderDirectlyQuoted = %v, want %v", got.PlaceholderDirectlyQuoted, tc.wantDirectlyQuoted)
 			}
 			if got.ExecutableRaw != tc.wantExe {
 				t.Errorf("ExecutableRaw = %q, want %q", got.ExecutableRaw, tc.wantExe)

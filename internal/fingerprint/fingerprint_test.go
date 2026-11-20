@@ -3,6 +3,8 @@ package fingerprint
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +14,42 @@ func TestInspect_DanglingBinary(t *testing.T) {
 
 	if info.Exists || !info.Dangling || info.Runtime != RuntimeDangling || info.HighRiskRuntime {
 		t.Fatalf("unexpected dangling result: %+v", info)
+	}
+}
+
+func TestInspect_ScriptHandlers(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing script must remain dangling, not RuntimeShell.
+	missingBat := filepath.Join(dir, "missing.bat")
+	if info := Inspect(missingBat); !info.Dangling || info.Runtime != RuntimeDangling || info.HighRiskRuntime {
+		t.Fatalf("missing .bat should be dangling: %+v", info)
+	}
+
+	cases := []struct {
+		file      string
+		wantCmd   bool
+		wantEvSub string
+	}{
+		{"handler.bat", true, "metacharacters"},
+		{"handler.cmd", true, "metacharacters"},
+		{"handler.ps1", false, "script=.ps1"},
+		{"handler.vbs", false, "script=.vbs"},
+	}
+
+	for _, tc := range cases {
+		p := filepath.Join(dir, tc.file)
+		mustWriteFile(t, p, "@echo off\n")
+		info := Inspect(p)
+		if !info.Exists || info.Dangling || info.Runtime != RuntimeShell || !info.HighRiskRuntime {
+			t.Errorf("%s: got %+v, want existing RuntimeShell + HighRiskRuntime", tc.file, info)
+		}
+		if info.IsCmdShell() != tc.wantCmd {
+			t.Errorf("%s: IsCmdShell() = %v, want %v", tc.file, info.IsCmdShell(), tc.wantCmd)
+		}
+		if !strings.Contains(strings.Join(info.Evidence, " "), tc.wantEvSub) {
+			t.Errorf("%s: evidence %v missing %q", tc.file, info.Evidence, tc.wantEvSub)
+		}
 	}
 }
 
@@ -86,6 +124,37 @@ func TestInspect_SharedDirSkipsSubdirScan(t *testing.T) {
 	if info := Inspect(toolExe); info.Runtime != RuntimeNative || info.HighRiskRuntime {
 		t.Errorf("AppData\\Local\\Programs subdir scan false positive: %+v", info)
 	}
+
+	// A nested project path ending in \windows (e.g. D:\proj\build\windows) must NOT
+	// be treated as C:\Windows; its 1-level versioned Electron subdir must still be scanned.
+	buildWin := filepath.Join(t.TempDir(), "proj", "build", "windows")
+	appExe := filepath.Join(buildWin, "MyApp.exe")
+	mustWriteFile(t, appExe, "stub")
+	mustWriteFile(t, filepath.Join(buildWin, "1.0.0", "resources", "app.asar"), "asar")
+
+	if info := Inspect(appExe); info.Runtime != RuntimeElectron || !info.HighRiskRuntime {
+		t.Errorf("nested \\build\\windows dir should still scan versioned subdir: %+v", info)
+	}
+}
+
+func TestInspect_BareNameIgnoresCWD(t *testing.T) {
+	// A stray dummy file in the current working directory must not be resolved for a bare name.
+	tmp := t.TempDir()
+	mustWriteFile(t, filepath.Join(tmp, "uriarghunt-cwd-decoy.exe"), "decoy")
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(orig) }()
+
+	info := Inspect("uriarghunt-cwd-decoy.exe")
+	if info.Exists || !info.Dangling {
+		t.Errorf("bare executable resolved from CWD instead of App Paths/PATH: %+v", info)
+	}
 }
 
 func TestInspect_ShellJavaAndLOLBin(t *testing.T) {
@@ -114,9 +183,13 @@ func TestInspect_ShellJavaAndLOLBin(t *testing.T) {
 }
 
 func TestInspect_RealWindowsPE(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows only")
+	}
+
 	info := Inspect("cmd.exe")
-	if !info.Exists || !info.ValidPE {
-		t.Fatalf("cmd.exe should be a valid PE: %+v", info)
+	if !info.Exists || !info.ValidPE || !info.IsCmdShell() {
+		t.Fatalf("cmd.exe should be a valid PE cmd shell: %+v", info)
 	}
 	if info.Architecture != "x64" && info.Architecture != "x86" && info.Architecture != "arm64" {
 		t.Errorf("unexpected arch %q", info.Architecture)

@@ -16,7 +16,7 @@ import (
 	"uriarghunt/internal/registry"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Tier ranks findings by deterministic evidence strength.
 type Tier int
@@ -96,6 +96,8 @@ type ScanReport struct {
 }
 
 // EvaluateFinding assigns a Tier (0-3) and concise rationale from all four analysis layers.
+// TIER 3 is reserved strictly for verified browser-surviving vectors (such as unquoted
+// cmd.exe/.bat/.cmd '&' injection or a split that survives browser percent-encoding).
 func EvaluateFinding(h registry.Handler, p argv.ProbeReport, fp fingerprint.Info, br browser.Assessment) Finding {
 	isBuiltin, builtinCat := ClassifyBuiltin(h.Scheme)
 
@@ -115,6 +117,9 @@ func EvaluateFinding(h registry.Handler, p argv.ProbeReport, fp fingerprint.Info
 	}
 	if h.Analysis.UnquotedExeSpaces {
 		reasons = append(reasons, "unquoted executable path with spaces")
+	}
+	if fp.Fuses != nil && fp.Fuses.InspectHardened {
+		reasons = append(reasons, "fuses:hardened (RunAsNode & EnableNodeCliInspect disabled)")
 	}
 
 	if h.Command == "" {
@@ -137,15 +142,25 @@ func EvaluateFinding(h registry.Handler, p argv.ProbeReport, fp fingerprint.Info
 		return f
 	}
 
-	preDDBackslashBreak := br.BackslashBreak && !br.BackslashAfterDD
-	postDDBackslashBreak := br.BackslashBreak && br.BackslashAfterDD
+	// Browser-surviving '&' command separator on unquoted cmd.exe/.bat/.cmd is immediately TIER 3.
+	if br.ShellAmpersandSurvive {
+		reasons = append(reasons, "unquoted cmd/batch handler receives raw '&' through browsers")
+		f.Tier = Tier3
+		f.TierLabel = f.Tier.String()
+		f.Reasons = reasons
+		return f
+	}
+
+	preDDLocalBackslash := br.Local.BackslashBreak && !br.Local.BackslashAfterDD
+	postDDLocalBackslash := br.Local.BackslashBreak && br.Local.BackslashAfterDD
 	hasUnmitigatedSplit := p.AnyUnmitigatedFlag ||
 		(p.AnySplit && !p.AnyMitigatedFlag) ||
-		preDDBackslashBreak
+		preDDLocalBackslash ||
+		br.BrowserSplitSurvives
 
 	if !hasUnmitigatedSplit {
-		if postDDBackslashBreak {
-			reasons = append(reasons, "trailing backslash corrupts positional args after '--'")
+		if postDDLocalBackslash {
+			reasons = append(reasons, "local ShellExecute trailing backslash corrupts positional args after '--'")
 			f.Tier = Tier1
 			f.TierLabel = f.Tier.String()
 			f.Reasons = reasons
@@ -173,12 +188,19 @@ func EvaluateFinding(h registry.Handler, p argv.ProbeReport, fp fingerprint.Info
 	}
 
 	tier := Tier1
-	if preDDBackslashBreak {
-		reasons = append(reasons, "trailing backslash breaks closing quote before '--'")
-	} else if p.AnyUnmitigatedFlag {
-		reasons = append(reasons, "CommandLineToArgvW splits standalone flag before '--'")
-	} else {
-		reasons = append(reasons, "CommandLineToArgvW increases argc")
+	switch {
+	case br.BrowserSplitSurvives:
+		reasons = append(reasons, "CommandLineToArgvW split survives browser percent-encoding")
+	case preDDLocalBackslash:
+		reasons = append(reasons, "local ShellExecute trailing backslash breaks closing quote before '--'")
+	case p.AnyUnmitigatedFlag:
+		reasons = append(reasons, "local CommandLineToArgvW splits standalone flag before '--'")
+	default:
+		reasons = append(reasons, "local CommandLineToArgvW increases argc")
+	}
+
+	if p.MissingDoubleDash {
+		reasons = append(reasons, "missing--")
 	}
 
 	if fp.HighRiskRuntime {
@@ -186,13 +208,8 @@ func EvaluateFinding(h registry.Handler, p argv.ProbeReport, fp fingerprint.Info
 		reasons = append(reasons, fmt.Sprintf("high-risk runtime (%s)", fp.Runtime))
 	}
 
-	if tier == Tier2 && (br.Reachability == browser.ReachabilityBrowserSplit || br.Reachability == browser.ReachabilityLocalSplitDashCand) {
+	if tier == Tier2 && br.BrowserSplitSurvives {
 		tier = Tier3
-		if br.Reachability == browser.ReachabilityBrowserSplit {
-			reasons = append(reasons, "browser-surviving argv boundary break before '--'")
-		} else {
-			reasons = append(reasons, "missing '--' dash candidate (verify app-side argv/ASAR handling)")
-		}
 	}
 
 	f.Tier = tier
@@ -263,7 +280,7 @@ func BuildReport(all []Finding, opts FilterOptions) ScanReport {
 			sum.HiddenBuiltinCount++
 			continue
 		}
-		if opts.OnlySplits && !f.Probe.AnySplit && !f.Browser.BackslashBreak {
+		if opts.OnlySplits && !f.Probe.AnySplit && !f.Browser.Local.BackslashBreak && !f.Browser.ShellAmpersandSurvive {
 			continue
 		}
 		if f.Tier < opts.MinTier {
@@ -317,8 +334,8 @@ func WriteTable(w io.Writer, rep ScanReport) {
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "TIER\tSCHEME\tSCOPE\tHIVE\tPLACEHOLDER\tSPLIT(A/B)\tFLAG\tRUNTIME\tREACHABILITY\tTARGET_EXE")
-	fmt.Fprintln(tw, "------\t------\t-----\t----\t-----------\t----------\t----\t-------\t------------\t----------")
+	fmt.Fprintln(tw, "TIER\tSCHEME\tSCOPE\tHIVE\tPLACEHOLDER\tSPLIT(A/B)\tFLAG\tRUNTIME\tFUSES\tREACHABILITY\tTARGET_EXE")
+	fmt.Fprintln(tw, "------\t------\t-----\t----\t-----------\t----------\t----\t-------\t-----\t------------\t----------")
 
 	for _, f := range rep.Findings {
 		scope := "3rd-party"
@@ -347,7 +364,7 @@ func WriteTable(w io.Writer, rep ScanReport) {
 			exeName = filepath.Base(f.Handler.Analysis.ExecutableRaw)
 		}
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			f.TierLabel,
 			f.Scheme,
 			scope,
@@ -356,14 +373,15 @@ func WriteTable(w io.Writer, rep ScanReport) {
 			FormatSplitPair(f.Probe),
 			FormatFlagLabel(f.Probe, f.Browser),
 			string(f.Fingerprint.Runtime),
-			string(f.Browser.Reachability),
+			f.Fingerprint.Fuses.ShortLabel(),
+			formatReachability(f.Probe, f.Browser),
 			exeName,
 		)
 	}
 	_ = tw.Flush()
 
-	fmt.Fprintln(w, "\nNotes: HIVE* = HKCU shadows HKLM. TIER 3 indicates a high-priority candidate; verify app-side argv handling manually.")
-	fmt.Fprintln(w, "Run `uriarghunt inspect <scheme>` for full argv breakdown or `uriarghunt scan --json` for JSON output.")
+	fmt.Fprintln(w, "\nLegend: SPLIT(A/B) = quote_split/space_split argc delta | HIVE* = HKCU shadows HKLM | FUSES = Electron Fuses v1 (hardened = RunAsNode & EnableNodeCliInspect disabled)")
+	fmt.Fprintln(w, "Run `uriarghunt inspect <scheme>` for full argv/fuses breakdown or `uriarghunt scan --json` for JSON output.")
 }
 
 // WriteJSON encodes ScanReport as indented JSON.
@@ -409,7 +427,7 @@ func WriteInspect(w io.Writer, f Finding) {
 	fmt.Fprintf(w, "Template        : placeholder=%q quoted=%v double_dash=%v attached_to_flag=%v unquoted_exe_spaces=%v\n",
 		h.Analysis.Placeholder,
 		h.Analysis.PlaceholderQuoted,
-		h.Analysis.HasDoubleDash,
+		p.HasDoubleDash,
 		p.AttachedToFlag,
 		h.Analysis.UnquotedExeSpaces,
 	)
@@ -422,23 +440,42 @@ func WriteInspect(w io.Writer, f Finding) {
 		fmt.Fprintf(w, "Evidence        : %s\n", strings.Join(fp.Evidence, ", "))
 	}
 
+	if fp.Fuses != nil {
+		fmt.Fprintln(w, "\n[Electron Fuses v1]")
+		fmt.Fprintf(w, "Found           : %v (wire=%q, hardened=%v)\n", fp.Fuses.Found, fp.Fuses.RawWire, fp.Fuses.InspectHardened)
+		if fp.Fuses.Found {
+			fmt.Fprintf(w, "RunAsNode       : %s\n", fp.Fuses.RunAsNode)
+			fmt.Fprintf(w, "CliInspectArgs  : %s\n", fp.Fuses.EnableNodeCliInspect)
+			fmt.Fprintf(w, "NodeOptionsEnv  : %s\n", fp.Fuses.EnableNodeOptionsEnv)
+			fmt.Fprintf(w, "OnlyLoadAsar    : %s\n", fp.Fuses.OnlyLoadAppFromAsar)
+		}
+		if fp.Fuses.Error != "" {
+			fmt.Fprintf(w, "Error           : %s\n", fp.Fuses.Error)
+		}
+	}
+
 	fmt.Fprintln(w, "\n[Browser Escape]")
-	fmt.Fprintf(w, "Reachability    : %s\n", br.Reachability)
-	fmt.Fprintf(w, "Chrome/Edge 130+: split_survives=%v backslash_break=%v dash_preserved=%v\n",
-		br.ChromeEdge130.SplitSurvives, br.ChromeEdge130.BackslashBreak, br.ChromeEdge130.DashPreserved)
-	fmt.Fprintf(w, "Firefox Current : split_survives=%v backslash_break=%v dash_preserved=%v\n",
-		br.FirefoxCurrent.SplitSurvives, br.FirefoxCurrent.BackslashBreak, br.FirefoxCurrent.DashPreserved)
-	if br.BackslashBreak {
-		for _, ch := range []browser.ChannelResult{br.ChromeEdge130, br.FirefoxCurrent} {
-			if !ch.BackslashBreak {
-				continue
-			}
-			pos := "before --"
-			if ch.BackslashAfterDD {
-				pos = "after -- positional"
-			}
-			fmt.Fprintf(w, "Backslash Proof : [%s | %s] %s (delta=%+d) -> %#v\n",
-				ch.Profile, pos, ch.BackslashURI, ch.BackslashDelta, ch.BackslashArgv)
+	fmt.Fprintf(w, "Reachability    : %s\n", formatReachability(p, br))
+	fmt.Fprintf(w, "Chromium 157+   : split_survives=%v backslash_break=%v ampersand_raw=%v (verified=%v)\n",
+		br.Chromium.SplitSurvives, br.Chromium.BackslashBreak, br.Chromium.AmpersandRaw, br.Chromium.Verified)
+	fmt.Fprintf(w, "Firefox Modeled : split_survives=%v backslash_break=%v ampersand_raw=%v (verified=%v)\n",
+		br.Firefox.SplitSurvives, br.Firefox.BackslashBreak, br.Firefox.AmpersandRaw, br.Firefox.Verified)
+	fmt.Fprintf(w, "Local ShellExec : raw_split=%v backslash_break=%v after_dd=%v\n",
+		br.Local.RawSplitWorks, br.Local.BackslashBreak, br.Local.BackslashAfterDD)
+	if br.ShellAmpersandSurvive {
+		fmt.Fprintf(w, "Cmd '&' Proof   : %s (unquoted cmd/batch handler)\n", br.Chromium.AmpersandURI)
+	}
+	if br.Local.BackslashBreak {
+		pos := "before --"
+		if br.Local.BackslashAfterDD {
+			pos = "after -- positional"
+		}
+		fmt.Fprintf(w, "Backslash Proof : [local ShellExecute | %s] %s (delta=%+d) -> %#v\n",
+			pos, br.Local.BackslashURI, br.Local.BackslashDelta, br.Local.BackslashArgv)
+	}
+	for _, ch := range []browser.ChannelResult{br.Chromium, br.Firefox} {
+		if ch.BackslashBreak {
+			fmt.Fprintf(w, "Backslash Proof : [%s] %s\n", ch.Profile, ch.BackslashURI)
 		}
 	}
 	fmt.Fprintf(w, "Summary         : %s\n", br.Summary)
@@ -466,12 +503,22 @@ func WriteInspect(w io.Writer, f Finding) {
 	}
 }
 
+func formatReachability(p argv.ProbeReport, br browser.Assessment) string {
+	label := string(br.Reachability)
+	if p.MissingDoubleDash && (br.Reachability == browser.ReachabilityLocalOnly || br.Reachability == browser.ReachabilityLocalBackslash) {
+		return label + ",missing--"
+	}
+	return label
+}
+
 // FormatFlagLabel returns a short status tag for the table FLAG column.
 func FormatFlagLabel(p argv.ProbeReport, br browser.Assessment) string {
 	switch {
-	case br.BackslashBreak && !br.BackslashAfterDD:
-		return "BSLASH!"
-	case br.BackslashBreak && br.BackslashAfterDD:
+	case br.ShellAmpersandSurvive:
+		return "CMD&!"
+	case br.Local.BackslashBreak && !br.Local.BackslashAfterDD:
+		return "BSLASH"
+	case br.Local.BackslashBreak && br.Local.BackslashAfterDD:
 		return "bslash--"
 	case p.AnyUnmitigatedFlag:
 		return "YES"

@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"uriarghunt/internal/fuses"
 )
 
 // RuntimeKind classifies the target executable runtime.
@@ -24,7 +26,7 @@ const (
 	RuntimeUnknown  RuntimeKind = "unknown"
 )
 
-// Info describes the resolved target binary, PE metadata, and runtime classification.
+// Info describes the resolved target binary, PE metadata, Electron fuses, and runtime class.
 type Info struct {
 	RawExecutable   string      `json:"raw_executable,omitempty"`
 	ResolvedPath    string      `json:"resolved_path,omitempty"`
@@ -35,8 +37,23 @@ type Info struct {
 	Subsystem       string      `json:"subsystem,omitempty"`
 	Runtime         RuntimeKind `json:"runtime"`
 	HighRiskRuntime bool        `json:"high_risk_runtime"`
+	Fuses           *fuses.Info `json:"fuses,omitempty"`
 	Evidence        []string    `json:"evidence,omitempty"`
 	PEError         string      `json:"pe_error,omitempty"`
+}
+
+// IsCmdShell reports whether the existing target runs through cmd.exe
+// (either cmd.exe directly or a .bat/.cmd script), where unquoted `&` acts as a command separator.
+func (info Info) IsCmdShell() bool {
+	if !info.Exists || info.Dangling {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(info.ResolvedPath))
+	if base == "cmd.exe" {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(base))
+	return ext == ".bat" || ext == ".cmd"
 }
 
 var (
@@ -63,8 +80,8 @@ var (
 	}
 )
 
-// Inspect resolves rawExe, validates its PE header via debug/pe, and classifies
-// its runtime from binary name, imported DLLs, and installation directory artifacts.
+// Inspect resolves rawExe, validates its PE header via debug/pe, classifies its runtime,
+// and decodes Electron Fuses v1 when the target is an Electron binary.
 func Inspect(rawExe string) Info {
 	trimmed := strings.TrimSpace(strings.Trim(rawExe, `"`))
 	if trimmed == "" {
@@ -89,19 +106,31 @@ func Inspect(rawExe string) Info {
 
 	importedDLLs := inspectPE(resolved, &info)
 	info.Runtime, info.HighRiskRuntime, info.Evidence = classifyRuntime(resolved, importedDLLs)
+
+	if info.Runtime == RuntimeElectron && info.ValidPE {
+		fi := fuses.InspectFile(resolved)
+		info.Fuses = &fi
+	}
+
 	return info
 }
 
 func resolveExecutable(raw string) (string, bool) {
-	cleaned := filepath.Clean(raw)
-	if st, err := os.Stat(cleaned); err == nil && !st.IsDir() {
-		return cleaned, true
-	}
-
+	// Bare executable names (e.g. "cmd.exe", "msedge.exe") must resolve via App Paths
+	// or PATH rather than os.Stat in CWD to prevent working-directory hijacking.
 	if !strings.ContainsAny(raw, `\/:`) {
+		if found, ok := lookupAppPaths(raw); ok {
+			return found, true
+		}
 		if found, err := exec.LookPath(raw); err == nil {
 			return filepath.Clean(found), true
 		}
+		return "", false
+	}
+
+	cleaned := filepath.Clean(raw)
+	if st, err := os.Stat(cleaned); err == nil && !st.IsDir() {
+		return cleaned, true
 	}
 
 	if filepath.Ext(cleaned) == "" {
@@ -141,10 +170,23 @@ func inspectPE(path string, info *Info) []string {
 
 func classifyRuntime(resolvedPath string, importedDLLs []string) (RuntimeKind, bool, []string) {
 	base := strings.ToLower(filepath.Base(resolvedPath))
+	ext := strings.ToLower(filepath.Ext(base))
 	dir := filepath.Dir(resolvedPath)
 
+	// Script handlers verified to exist on disk.
+	switch ext {
+	case ".bat", ".cmd":
+		return RuntimeShell, true, []string{"script=" + ext, "cmd.exe metacharacters (&, |, %VAR%)"}
+	case ".ps1", ".vbs":
+		return RuntimeShell, true, []string{"script=" + ext}
+	}
+
 	if _, ok := shellInterpreters[base]; ok {
-		return RuntimeShell, true, []string{"executable=" + base}
+		ev := []string{"executable=" + base}
+		if base == "cmd.exe" {
+			ev = append(ev, "cmd.exe metacharacters (&, |, %VAR%)")
+		}
+		return RuntimeShell, true, ev
 	}
 	if _, ok := javaRunners[base]; ok {
 		return RuntimeJava, true, []string{"executable=" + base}
@@ -273,8 +315,13 @@ func isSharedDir(dir string) bool {
 		}
 	}
 
+	// Match drive-root X:\windows directly so nested paths like D:\proj\build\windows
+	// are not misclassified as shared system directories.
+	if len(clean) == 10 && clean[1:] == `:\windows` {
+		return true
+	}
+
 	for _, suffix := range []string{
-		`\windows`,
 		`\windows\system32`,
 		`\windows\syswow64`,
 		`\appdata\local`,

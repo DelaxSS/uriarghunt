@@ -7,87 +7,113 @@ import (
 	"uriarghunt/internal/argv"
 )
 
-// Profile identifies a browser non-special URI escaping profile.
+// Profile identifies a browser non-special URI escaping model.
 type Profile string
 
 const (
-	// ProfileChromeEdge130 models Chromium 130+ StandardCompliantNonSpecialSchemeURLParsing.
-	ProfileChromeEdge130  Profile = "chrome-edge-130+"
-	ProfileFirefoxCurrent Profile = "firefox-current"
+	// ProfileChromium reflects live Windows 11 measurements on Chrome 157,
+	// Edge 157, and Opera GX 139.
+	ProfileChromium Profile = "chromium-157"
+
+	// ProfileFirefox models standard non-special escaping (not empirically verified on this host).
+	ProfileFirefox Profile = "firefox-modeled"
 )
 
-// Reachability summarizes how a command template behaves under browser escaping.
+// Reachability classifies how a handler's command template behaves across browsers
+// and local Windows ShellExecute triggers.
 type Reachability string
 
 const (
-	ReachabilityNone               Reachability = "none"
-	ReachabilityMitigated          Reachability = "mitigated"
-	ReachabilityLocalOnly          Reachability = "local-only"
-	ReachabilityLocalSplitDashCand Reachability = "local-split+dash-cand"
-	ReachabilityBrowserPosSplit    Reachability = "browser-pos-split"
-	ReachabilityBrowserSplit       Reachability = "browser-split"
+	ReachabilityNone             Reachability = "none"
+	ReachabilityMitigated        Reachability = "mitigated"
+	ReachabilityLocalOnly        Reachability = "local-only"
+	ReachabilityLocalBackslash   Reachability = "local-backslash"
+	ReachabilityLocalBackslashDD Reachability = "local-backslash--"
+	ReachabilityBrowserSplit     Reachability = "browser-split"
+	ReachabilityBrowserCmdAmp    Reachability = "browser-cmd-amp"
 )
+
+// TargetContext supplies handler properties needed for browser-to-shell checks.
+// PlaceholderDirectlyQuoted must be true only when the placeholder itself is directly
+// wrapped in quotes (`"%1"`), not merely enclosed inside an outer `cmd /c "..."` string.
+type TargetContext struct {
+	IsCmdShell                bool
+	PlaceholderDirectlyQuoted bool
+}
 
 // ChannelResult records CommandLineToArgvW outcomes after applying one browser profile.
 type ChannelResult struct {
-	Profile          Profile  `json:"profile"`
-	QuoteURI         string   `json:"quote_uri,omitempty"`
-	SpaceURI         string   `json:"space_uri,omitempty"`
-	DashURI          string   `json:"dash_uri,omitempty"`
+	Profile          Profile `json:"profile"`
+	Verified         bool    `json:"verified"`
+	QuoteURI         string  `json:"quote_uri,omitempty"`
+	SpaceURI         string  `json:"space_uri,omitempty"`
+	BackslashURI     string  `json:"backslash_uri,omitempty"`
+	AmpersandURI     string  `json:"ampersand_uri,omitempty"`
+	SplitSurvives    bool    `json:"split_survives"`
+	UnmitigatedSplit bool    `json:"unmitigated_split"`
+	BackslashBreak   bool    `json:"backslash_break"`
+	AmpersandRaw     bool    `json:"ampersand_raw"`
+}
+
+// LocalResult records empirically verified raw Windows ShellExecute behavior
+// (no percent-encoding applied before CommandLineToArgvW).
+type LocalResult struct {
+	RawSplitWorks    bool     `json:"raw_split_works"`
 	BackslashURI     string   `json:"backslash_uri,omitempty"`
 	BackslashArgv    []string `json:"backslash_argv,omitempty"`
 	BackslashDelta   int      `json:"backslash_delta,omitempty"`
 	BackslashBreak   bool     `json:"backslash_break"`
 	BackslashAfterDD bool     `json:"backslash_after_dd,omitempty"`
-	SplitSurvives    bool     `json:"split_survives"`
-	UnmitigatedSplit bool     `json:"unmitigated_split"`
-	DashPreserved    bool     `json:"dash_preserved"`
 }
 
-// Assessment combines browser-escaped parsing results with local raw split results.
+// Assessment combines empirical Chromium escaping, modeled Firefox escaping,
+// and local Windows ShellExecute behavior.
 type Assessment struct {
-	Reachability     Reachability  `json:"reachability"`
-	ChromeEdge130    ChannelResult `json:"chrome_edge_130"`
-	FirefoxCurrent   ChannelResult `json:"firefox_current"`
-	LocalSplit       bool          `json:"local_split"`
-	BrowserBlocked   bool          `json:"browser_blocked"`
-	BackslashBreak   bool          `json:"backslash_break"`
-	BackslashAfterDD bool          `json:"backslash_after_dd,omitempty"`
-	DashSurvives     bool          `json:"dash_survives"`
-	Summary          string        `json:"summary"`
+	Reachability          Reachability  `json:"reachability"`
+	Chromium              ChannelResult `json:"chromium"`
+	Firefox               ChannelResult `json:"firefox"`
+	Local                 LocalResult   `json:"local"`
+	BrowserSplitSurvives  bool          `json:"browser_split_survives"`
+	BrowserBlocked        bool          `json:"browser_blocked"`
+	ShellAmpersandSurvive bool          `json:"shell_ampersand_survives"`
+	Summary               string        `json:"summary"`
 }
 
-// EscapeURI applies percent-encoding rules for non-special schemes while preserving
-// the scheme prefix, hyphens, and literal backslashes.
-func EscapeURI(rawURI string, profile Profile) string {
+// EscapeURI percent-encodes characters in non-special schemes per Chrome 157 / Edge 157 / Opera GX 139
+// measurements: space, ", \, <, >, `, |, ^, and % are encoded; & passes raw.
+// Note: Chromium browsers reject links containing ", space, or \ in the authority/host component.
+func EscapeURI(rawURI string, _ Profile) string {
 	colon := strings.IndexByte(rawURI, ':')
 	if colon == -1 {
-		return escapeRemainder(rawURI, profile)
+		return escapeRemainder(rawURI)
 	}
-	return rawURI[:colon+1] + escapeRemainder(rawURI[colon+1:], profile)
+	return rawURI[:colon+1] + escapeRemainder(rawURI[colon+1:])
 }
 
-func escapeRemainder(s string, profile Profile) string {
+func escapeRemainder(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 16)
 
 	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
+		switch ch := s[i]; ch {
+		case '%':
+			b.WriteString("%25")
 		case ' ':
 			b.WriteString("%20")
 		case '"':
 			b.WriteString("%22")
+		case '\\':
+			b.WriteString("%5C")
 		case '<':
 			b.WriteString("%3C")
 		case '>':
 			b.WriteString("%3E")
 		case '`':
-			if profile == ProfileChromeEdge130 {
-				b.WriteString("%60")
-			} else {
-				b.WriteByte(ch)
-			}
+			b.WriteString("%60")
+		case '|':
+			b.WriteString("%7C")
+		case '^':
+			b.WriteString("%5E")
 		default:
 			b.WriteByte(ch)
 		}
@@ -95,9 +121,9 @@ func escapeRemainder(s string, profile Profile) string {
 	return b.String()
 }
 
-// Evaluate tests probe's template through Chrome/Edge 130+ and Firefox escaping,
-// then re-parses the resulting command lines with real CommandLineToArgvW.
-func Evaluate(probe argv.ProbeReport) Assessment {
+// Evaluate tests probe's template against browser-escaped URIs and raw local ShellExecute,
+// using real Win32 CommandLineToArgvW for split and trailing-backslash verification.
+func Evaluate(probe argv.ProbeReport, ctx TargetContext) Assessment {
 	if !probe.HasPlaceholder {
 		return Assessment{
 			Reachability: ReachabilityNone,
@@ -105,68 +131,65 @@ func Evaluate(probe argv.ProbeReport) Assessment {
 		}
 	}
 
-	ce := evaluateChannel(probe, ProfileChromeEdge130)
-	ff := evaluateChannel(probe, ProfileFirefoxCurrent)
+	ch := evaluateChannel(probe, ProfileChromium, true)
+	ff := evaluateChannel(probe, ProfileFirefox, false)
+	loc := evaluateLocal(probe)
 
-	backslashBreak := ce.BackslashBreak || ff.BackslashBreak
-	backslashAfterDD := backslashBreak && probe.HasDoubleDash
+	browserSplit := ch.SplitSurvives || ff.SplitSurvives
+	ampSurvives := ctx.IsCmdShell && !ctx.PlaceholderDirectlyQuoted && (ch.AmpersandRaw || ff.AmpersandRaw)
 
 	a := Assessment{
-		ChromeEdge130:    ce,
-		FirefoxCurrent:   ff,
-		BackslashBreak:   backslashBreak,
-		BackslashAfterDD: backslashAfterDD,
-		LocalSplit:       probe.AnyUnmitigatedFlag || (probe.AnySplit && !probe.AnyMitigatedFlag),
+		Chromium:              ch,
+		Firefox:               ff,
+		Local:                 loc,
+		BrowserSplitSurvives:  browserSplit,
+		BrowserBlocked:        (probe.AnySplit || loc.BackslashBreak) && !browserSplit && !ampSurvives,
+		ShellAmpersandSurvive: ampSurvives,
 	}
 
-	browserSurvives := ce.SplitSurvives || ff.SplitSurvives
-	a.BrowserBlocked = probe.AnySplit && !browserSurvives
-	a.DashSurvives = probe.MissingDoubleDash && (ce.DashPreserved || ff.DashPreserved)
-
 	switch {
-	case backslashBreak && !backslashAfterDD:
-		a.Reachability = ReachabilityBrowserSplit
-		a.Summary = "trailing '\\' escapes the closing quote of \"%1\" before '--' and alters subsequent argv boundaries"
-	case backslashBreak && backslashAfterDD:
-		a.Reachability = ReachabilityBrowserPosSplit
-		a.Summary = "trailing '\\' breaks positional argument boundaries after '--' (no pre-'--' flag injection)"
-	case browserSurvives:
+	case ampSurvives:
+		a.Reachability = ReachabilityBrowserCmdAmp
+		a.Summary = "unquoted cmd.exe/.bat/.cmd handler receives raw '&' through Chromium browsers (command separator)"
+	case browserSplit:
 		a.Reachability = ReachabilityBrowserSplit
 		a.Summary = "CommandLineToArgvW split survives browser percent-encoding"
+	case loc.BackslashBreak && !loc.BackslashAfterDD:
+		a.Reachability = ReachabilityLocalBackslash
+		a.Summary = "local ShellExecute trailing '\\' breaks '\"%1\"' closing quote before '--'; blocked in Chromium (%5C)"
+	case loc.BackslashBreak && loc.BackslashAfterDD:
+		a.Reachability = ReachabilityLocalBackslashDD
+		a.Summary = "local ShellExecute trailing '\\' corrupts positional args after '--'; blocked in Chromium (%5C)"
 	case probe.AnyMitigatedFlag && !probe.AnyUnmitigatedFlag:
 		a.Reachability = ReachabilityMitigated
 		a.Summary = "browser encoding blocks split; local raw split lands after '--'"
-	case a.LocalSplit && a.DashSurvives:
-		a.Reachability = ReachabilityLocalSplitDashCand
-		a.Summary = "raw quote/space split is local-only (browsers encode %22/%20); missing '--' leaves a dash-arg candidate"
-	case a.LocalSplit:
+	case loc.RawSplitWorks:
 		a.Reachability = ReachabilityLocalOnly
-		a.Summary = "split requires raw local trigger; Chrome/Edge 130+ and Firefox block it via %22/%20 encoding"
-	case a.DashSurvives:
-		a.Reachability = ReachabilityLocalSplitDashCand
-		a.Summary = "no argv split; missing '--' allows unencoded dash payload through browsers"
+		a.Summary = "local ShellExecute split confirmed; blocked in Chrome 157/Edge 157/Opera GX 139 (%20/%22/%5C)"
 	default:
 		a.Reachability = ReachabilityNone
-		a.Summary = "no argument split or missing '--' exposure"
+		a.Summary = "no argument split detected"
 	}
 
 	return a
 }
 
-func evaluateChannel(probe argv.ProbeReport, profile Profile) ChannelResult {
-	res := ChannelResult{Profile: profile}
+func evaluateChannel(probe argv.ProbeReport, profile Profile, verified bool) ChannelResult {
+	res := ChannelResult{
+		Profile:  profile,
+		Verified: verified,
+	}
 
 	for _, sc := range probe.Scenarios {
+		if sc.ID == argv.ScenarioDashFlag {
+			continue
+		}
 		escaped := EscapeURI(sc.TestURI, profile)
 		switch sc.ID {
 		case argv.ScenarioQuoteSplit:
 			res.QuoteURI = escaped
 		case argv.ScenarioSpaceSplit:
 			res.SpaceURI = escaped
-		case argv.ScenarioDashFlag:
-			res.DashURI = escaped
-			res.DashPreserved = strings.Contains(escaped, argv.CanaryFlag)
-			continue
 		}
 
 		cmd := argv.SubstituteURI(probe.Template, probe.Placeholder, escaped)
@@ -182,20 +205,39 @@ func evaluateChannel(probe argv.ProbeReport, profile Profile) ChannelResult {
 		}
 	}
 
-	// Non-special schemes keep a trailing backslash raw, which triggers Win32 `\"`
-	// quote-escaping when additional arguments follow `"%1"` in the template.
-	rawBS := fmt.Sprintf(`%s://probe\`, probe.Scheme)
+	// Trailing backslash test after browser escaping (Chromium encodes \ -> %5C).
+	rawBS := fmt.Sprintf(`%s://host/probe\`, probe.Scheme)
 	escapedBS := EscapeURI(rawBS, profile)
 	res.BackslashURI = escapedBS
+	if bsArgs, err := argv.SplitCommandLine(argv.SubstituteURI(probe.Template, probe.Placeholder, escapedBS)); err == nil {
+		if len(bsArgs) != probe.BaselineArgc {
+			res.BackslashBreak = true
+			res.SplitSurvives = true
+		}
+	}
 
-	bsCmd := argv.SubstituteURI(probe.Template, probe.Placeholder, escapedBS)
-	if bsArgs, err := argv.SplitCommandLine(bsCmd); err == nil {
+	// Raw '&' test for cmd.exe / .bat / .cmd handlers.
+	rawAmp := fmt.Sprintf(`%s://host/path?a=1&b=2`, probe.Scheme)
+	escapedAmp := EscapeURI(rawAmp, profile)
+	res.AmpersandURI = escapedAmp
+	res.AmpersandRaw = strings.Contains(escapedAmp, "&")
+
+	return res
+}
+
+func evaluateLocal(probe argv.ProbeReport) LocalResult {
+	res := LocalResult{
+		RawSplitWorks: probe.AnyUnmitigatedFlag || (probe.AnySplit && !probe.AnyMitigatedFlag),
+	}
+
+	rawBS := fmt.Sprintf(`%s://host/probe\`, probe.Scheme)
+	res.BackslashURI = rawBS
+	if bsArgs, err := argv.SplitCommandLine(argv.SubstituteURI(probe.Template, probe.Placeholder, rawBS)); err == nil {
 		res.BackslashArgv = bsArgs
 		res.BackslashDelta = len(bsArgs) - probe.BaselineArgc
 		if len(bsArgs) != probe.BaselineArgc {
 			res.BackslashBreak = true
 			res.BackslashAfterDD = probe.HasDoubleDash
-			res.SplitSurvives = true
 		}
 	}
 

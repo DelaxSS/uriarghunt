@@ -23,3 +23,17 @@ func TestParseTier(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeSchemeArg(t *testing.T) {
+	cases := map[string]string{
+		"vscode":               "vscode",
+		"vscode:":              "vscode",
+		"vscode://":            "vscode",
+		"  openvpn-connect:// ": "openvpn-connect",
+	}
+	for in, want := range cases {
+		if got := normalizeSchemeArg(in); got != want {
+			t.Errorf("normalizeSchemeArg(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

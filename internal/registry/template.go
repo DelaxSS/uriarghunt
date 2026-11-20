@@ -8,18 +8,38 @@ import (
 
 // TemplateAnalysis holds static properties extracted from a shell\open\command string.
 type TemplateAnalysis struct {
-	Placeholder       string `json:"placeholder,omitempty"`
-	HasPlaceholder    bool   `json:"has_placeholder"`
-	PlaceholderQuoted bool   `json:"placeholder_quoted"`
-	HasDoubleDash     bool   `json:"has_double_dash"`
-	ExecutableRaw     string `json:"executable_raw,omitempty"`
-	UnquotedExeSpaces bool   `json:"unquoted_exe_spaces"`
+	Placeholder               string `json:"placeholder,omitempty"`
+	HasPlaceholder            bool   `json:"has_placeholder"`
+	PlaceholderQuoted         bool   `json:"placeholder_quoted"`
+	PlaceholderDirectlyQuoted bool   `json:"placeholder_directly_quoted"`
+	ExecutableRaw             string `json:"executable_raw,omitempty"`
+	UnquotedExeSpaces         bool   `json:"unquoted_exe_spaces"`
 }
 
-var executableExtensions = []string{".exe", ".com", ".bat", ".cmd", ".vbs", ".ps1", ".msc"}
+var (
+	executableExtensions = []string{".exe", ".com", ".bat", ".cmd", ".vbs", ".ps1", ".msc"}
+
+	bareCommands = map[string]struct{}{
+		"cmd":        {},
+		"powershell": {},
+		"pwsh":       {},
+		"wscript":    {},
+		"cscript":    {},
+		"mshta":      {},
+		"rundll32":   {},
+		"java":       {},
+		"javaw":      {},
+		"node":       {},
+		"explorer":   {},
+		"msiexec":    {},
+		"regsvr32":   {},
+		"msdt":       {},
+		"control":    {},
+	}
+)
 
 // AnalyzeTemplate inspects a command template for URI placeholders, quoting,
-// `--` flag termination, and unquoted executable paths containing spaces.
+// and unquoted executable paths containing spaces.
 func AnalyzeTemplate(command string) TemplateAnalysis {
 	trimmed := strings.TrimSpace(command)
 	if trimmed == "" {
@@ -35,7 +55,7 @@ func AnalyzeTemplate(command string) TemplateAnalysis {
 
 	if ok {
 		res.PlaceholderQuoted = isInsideQuotes(trimmed, idx)
-		res.HasDoubleDash = hasDoubleDashBefore(trimmed[:idx])
+		res.PlaceholderDirectlyQuoted = isDirectlyQuoted(trimmed, idx, len(placeholder))
 	}
 
 	return res
@@ -129,36 +149,29 @@ func isInsideQuotes(s string, pos int) bool {
 	return inQuotes
 }
 
-func hasDoubleDashBefore(prefix string) bool {
-	inQuotes := false
-	var tok strings.Builder
-	tokens := make([]string, 0, 8)
-
-	for i := 0; i < len(prefix); i++ {
-		ch := prefix[i]
-		if ch == '"' {
-			inQuotes = !inQuotes
-			continue
-		}
-		if !inQuotes && unicode.IsSpace(rune(ch)) {
-			if tok.Len() > 0 {
-				tokens = append(tokens, tok.String())
-				tok.Reset()
-			}
-			continue
-		}
-		tok.WriteByte(ch)
+// isDirectlyQuoted distinguishes a directly-quoted placeholder (e.g. `"%1"`, `--url="%1"`)
+// from one merely sitting inside an outer shell wrapper (e.g. `cmd /c "start x.exe %1"`),
+// where cmd.exe strips the outer quotes before executing the inner command.
+func isDirectlyQuoted(s string, idx, phLen int) bool {
+	if !isInsideQuotes(s, idx) {
+		return false
 	}
-	if tok.Len() > 0 {
-		tokens = append(tokens, tok.String())
+	openIdx := strings.LastIndexByte(s[:idx], '"')
+	if openIdx == -1 {
+		return false
+	}
+	after := idx + phLen
+	relClose := strings.IndexByte(s[after:], '"')
+	if relClose == -1 {
+		return false
 	}
 
-	for i := 1; i < len(tokens); i++ {
-		if tokens[i] == "--" {
-			return true
-		}
+	beforePh := s[openIdx+1 : idx]
+	afterPh := s[after : after+relClose]
+	if strings.ContainsFunc(beforePh, unicode.IsSpace) || strings.ContainsFunc(afterPh, unicode.IsSpace) {
+		return false
 	}
-	return false
+	return true
 }
 
 func extractExecutable(trimmed string) (exe string, unquotedSpaces bool) {
@@ -168,6 +181,22 @@ func extractExecutable(trimmed string) (exe string, unquotedSpaces bool) {
 			return rest[:end], false
 		}
 		return rest, false
+	}
+
+	first, rest := splitFirstToken(trimmed)
+	if first == "" {
+		return "", false
+	}
+
+	// If the next token is a CLI flag (/c, -File, --flag), or the first token is
+	// a bare command without path separators, do not merge later script arguments.
+	if rest != "" && (strings.HasPrefix(rest, "/") || strings.HasPrefix(rest, "-")) {
+		return first, false
+	}
+	if !strings.ContainsAny(first, `\/:`) {
+		if _, known := bareCommands[strings.ToLower(first)]; known {
+			return first, false
+		}
 	}
 
 	lower := strings.ToLower(trimmed)
@@ -182,7 +211,7 @@ func extractExecutable(trimmed string) (exe string, unquotedSpaces bool) {
 			end := searchFrom + rel + len(ext)
 			if end == len(trimmed) || unicode.IsSpace(rune(trimmed[end])) || trimmed[end] == '"' {
 				candidate := trimmed[:end]
-				if !strings.ContainsAny(candidate, `"`) {
+				if isValidUnquotedExeCandidate(candidate) {
 					if bestEnd == -1 || end < bestEnd {
 						bestEnd = end
 					}
@@ -198,9 +227,31 @@ func extractExecutable(trimmed string) (exe string, unquotedSpaces bool) {
 		return candidate, strings.ContainsFunc(candidate, unicode.IsSpace)
 	}
 
-	fields := strings.Fields(trimmed)
-	if len(fields) > 0 {
-		return fields[0], false
+	return first, false
+}
+
+func splitFirstToken(s string) (first, rest string) {
+	idx := strings.IndexFunc(s, unicode.IsSpace)
+	if idx == -1 {
+		return s, ""
 	}
-	return "", false
+	return s[:idx], strings.TrimSpace(s[idx:])
+}
+
+func isValidUnquotedExeCandidate(candidate string) bool {
+	if strings.ContainsAny(candidate, `"`) {
+		return false
+	}
+	// Reject candidates that cross into a CLI flag or a separate drive-qualified argument.
+	fields := strings.Fields(candidate)
+	for i := 1; i < len(fields); i++ {
+		f := fields[i]
+		if strings.HasPrefix(f, "/") || strings.HasPrefix(f, "-") {
+			return false
+		}
+		if len(f) >= 2 && f[1] == ':' {
+			return false
+		}
+	}
+	return true
 }

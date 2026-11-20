@@ -75,10 +75,15 @@ func parseAndRunScan(args []string) {
 		os.Exit(2)
 	}
 
-	findings, err := scanAllFindings()
+	handlers, err := registry.ScanAll()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "registry scan failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	findings := make([]report.Finding, 0, len(handlers))
+	for _, h := range handlers {
+		findings = append(findings, evaluateHandler(h))
 	}
 
 	rep := report.BuildReport(findings, report.FilterOptions{
@@ -108,53 +113,55 @@ func parseAndRunInspect(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: uriarghunt inspect [--json] <scheme>")
 		os.Exit(2)
 	}
-	target := fs.Arg(0)
+	target := normalizeSchemeArg(fs.Arg(0))
 
-	findings, err := scanAllFindings()
+	handlers, err := registry.ScanAll()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "registry scan failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	var found *report.Finding
-	for i := range findings {
-		if strings.EqualFold(findings[i].Scheme, target) {
-			found = &findings[i]
+	// Analyze only the matching scheme instead of fingerprinting every installed handler.
+	var matched *registry.Handler
+	for i := range handlers {
+		if strings.EqualFold(handlers[i].Scheme, target) {
+			matched = &handlers[i]
 			break
 		}
 	}
 
-	if found == nil {
+	if matched == nil {
 		fmt.Fprintf(os.Stderr, "scheme not found: %q\n", target)
 		os.Exit(1)
 	}
 
+	finding := evaluateHandler(*matched)
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.SetEscapeHTML(false)
-		if err := enc.Encode(found); err != nil {
+		if err := enc.Encode(finding); err != nil {
 			fmt.Fprintf(os.Stderr, "encode json: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	report.WriteInspect(os.Stdout, *found)
+	report.WriteInspect(os.Stdout, finding)
 }
 
-func scanAllFindings() ([]report.Finding, error) {
-	handlers, err := registry.ScanAll()
-	if err != nil {
-		return nil, err
-	}
+func normalizeSchemeArg(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSuffix(s, "://")
+	return strings.TrimSuffix(s, ":")
+}
 
-	findings := make([]report.Finding, 0, len(handlers))
-	for _, h := range handlers {
-		p := argv.ProbeTemplate(h.Scheme, h.Command)
-		fp := fingerprint.Inspect(h.Analysis.ExecutableRaw)
-		br := browser.Evaluate(p)
-		findings = append(findings, report.EvaluateFinding(h, p, fp, br))
-	}
-	return findings, nil
+func evaluateHandler(h registry.Handler) report.Finding {
+	p := argv.ProbeTemplate(h.Scheme, h.Command)
+	fp := fingerprint.Inspect(h.Analysis.ExecutableRaw)
+	br := browser.Evaluate(p, browser.TargetContext{
+		IsCmdShell:                fp.IsCmdShell(),
+		PlaceholderDirectlyQuoted: h.Analysis.PlaceholderDirectlyQuoted,
+	})
+	return report.EvaluateFinding(h, p, fp, br)
 }
